@@ -22,50 +22,49 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.configuration.ide;
+package net.fabricmc.loom.util;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.Objects;
+
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.transform.TransformerException;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
-import org.gradle.api.Project;
-import org.gradle.api.tasks.SourceSet;
-import org.gradle.plugins.ide.eclipse.model.EclipseModel;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
+import org.gradle.api.Project;
 
 import net.fabricmc.loom.LoomGradleExtension;
-import net.fabricmc.loom.util.Constants;
-import net.fabricmc.loom.util.OperatingSystem;
+import net.fabricmc.loom.providers.MinecraftProvider;
 
 public class RunConfig {
 	public String configName;
-	public String eclipseProjectName;
-	public String ideaModuleName;
+	public String projectName;
 	public String mainClass;
-	public String runDirIdeaUrl;
 	public String runDir;
 	public String vmArgs;
 	public String programArgs;
-	public SourceSet sourceSet;
 
-	public Element genRuns(Element doc) {
+	public Element genRuns(Element doc) throws IOException, ParserConfigurationException, TransformerException {
 		Element root = this.addXml(doc, "component", ImmutableMap.of("name", "ProjectRunConfigurationManager"));
 		root = addXml(root, "configuration", ImmutableMap.of("default", "false", "name", configName, "type", "Application", "factoryName", "Application"));
 
-		this.addXml(root, "module", ImmutableMap.of("name", ideaModuleName));
+		this.addXml(root, "module", ImmutableMap.of("name", projectName));
 		this.addXml(root, "option", ImmutableMap.of("name", "MAIN_CLASS_NAME", "value", mainClass));
-		this.addXml(root, "option", ImmutableMap.of("name", "WORKING_DIRECTORY", "value", runDirIdeaUrl));
+		this.addXml(root, "option", ImmutableMap.of("name", "WORKING_DIRECTORY", "value", runDir));
 
 		if (!Strings.isNullOrEmpty(vmArgs)) {
 			this.addXml(root, "option", ImmutableMap.of("name", "VM_PARAMETERS", "value", vmArgs));
@@ -95,28 +94,21 @@ public class RunConfig {
 		return e;
 	}
 
-	private static String getIdeaModuleName(Project project, SourceSet srcs) {
-		String module = project.getName() + "." + srcs.getName();
-
-		while ((project = project.getParent()) != null) {
-			module = project.getName() + "." + module;
-		}
-
-		return module;
-	}
-
-	private static void populate(Project project, LoomGradleExtension extension, RunConfig runConfig, String environment) {
-		runConfig.configName += extension.isRootProject() ? "" : " (" + project.getPath() + ")";
-		runConfig.eclipseProjectName = project.getExtensions().getByType(EclipseModel.class).getProject().getName();
+	private static void populate(Project project, LoomGradleExtension extension, RunConfig runConfig, String mode) {
+		runConfig.projectName = project.getName();
+		runConfig.runDir = "file://$PROJECT_DIR$/" + extension.runDir;
 		runConfig.vmArgs = "";
-		runConfig.programArgs = "";
 
-		if ("launchwrapper".equals(extension.getLoaderLaunchMethod())) {
-			runConfig.mainClass = "net.minecraft.launchwrapper.Launch"; // TODO What about custom tweakers for run configs?
-			runConfig.programArgs += "--tweakClass " + ("client".equals(environment) ? Constants.LaunchWrapper.DEFAULT_FABRIC_CLIENT_TWEAKER : Constants.LaunchWrapper.DEFAULT_FABRIC_SERVER_TWEAKER);
-		} else {
+		switch (extension.getLoaderLaunchMethod()) {
+		case "launchwrapper":
+			runConfig.mainClass = "net.minecraft.launchwrapper.Launch";
+			runConfig.programArgs = "--tweakClass " + ("client".equals(mode) ? Constants.DEFAULT_FABRIC_CLIENT_TWEAKER : Constants.DEFAULT_FABRIC_SERVER_TWEAKER);
+			break;
+		default:
 			runConfig.mainClass = "net.fabricmc.devlaunchinjector.Main";
-			runConfig.vmArgs = "-Dfabric.dli.config=" + encodeEscaped(extension.getDevLauncherConfig().getAbsolutePath()) + " -Dfabric.dli.env=" + environment.toLowerCase();
+			runConfig.programArgs = "";
+			runConfig.vmArgs = "-Dfabric.dli.config=" + quoteIfNeeded(extension.getDevLauncherConfig().getAbsolutePath()) + " -Dfabric.dli.env=" + mode.toLowerCase();
+			break;
 		}
 
 		if (extension.getLoaderLaunchMethod().equals("launchwrapper")) {
@@ -124,7 +116,7 @@ public class RunConfig {
 			JsonObject installerJson = extension.getInstallerJson();
 
 			if (installerJson != null) {
-				List<String> sideKeys = ImmutableList.of(environment, "common");
+				List<String> sideKeys = ImmutableList.of(mode, "common");
 
 				// copy launchwrapper tweakers
 				if (installerJson.has("launchwrapper")) {
@@ -149,73 +141,35 @@ public class RunConfig {
 		}
 	}
 
-	// Turns camelCase/PascalCase into Capital Case
-	// caseConversionExample -> Case Conversion Example
-	private static String capitalizeCamelCaseName(String name) {
-		if (name.length() == 0) {
-			return "";
-		}
+	public static RunConfig clientRunConfig(Project project) {
+		LoomGradleExtension extension = project.getExtensions().getByType(LoomGradleExtension.class);
+		MinecraftProvider minecraftProvider = extension.getMinecraftProvider();
+		MinecraftVersionInfo minecraftVersionInfo = minecraftProvider.versionInfo;
 
-		return name.substring(0, 1).toUpperCase() + name.substring(1).replaceAll("([^A-Z])([A-Z])", "$1 $2");
+		RunConfig ideaClient = new RunConfig();
+		populate(project, extension, ideaClient, "client");
+		ideaClient.configName = "Minecraft Client";
+		ideaClient.vmArgs += getOSClientJVMArgs();
+		ideaClient.vmArgs += " -Dfabric.dli.main=" + getMainClass("client", extension);
+
+		return ideaClient;
 	}
 
-	public static RunConfig runConfig(Project project, RunConfigSettings settings) {
+	public static RunConfig serverRunConfig(Project project) {
 		LoomGradleExtension extension = project.getExtensions().getByType(LoomGradleExtension.class);
-		String name = settings.getName();
 
-		String configName = settings.getConfigName();
-		String environment = settings.getEnvironment();
-		SourceSet sourceSet = settings.getSource(project);
+		RunConfig ideaServer = new RunConfig();
+		populate(project, extension, ideaServer, "server");
+		ideaServer.configName = "Minecraft Server";
+		ideaServer.vmArgs += " -Dfabric.dli.main=" + getMainClass("server", extension);
 
-		String defaultMain = settings.getDefaultMainClass();
+		return ideaServer;
+	}
 
-		if (defaultMain == null) {
-			throw new IllegalArgumentException("Run configuration '" + name + "' must specify 'defaultMainClass'");
-		}
-
-		if (configName == null) {
-			configName = "";
-			String srcName = sourceSet.getName();
-
-			if (!srcName.equals(SourceSet.MAIN_SOURCE_SET_NAME)) {
-				configName += capitalizeCamelCaseName(srcName) + " ";
-			}
-
-			configName += "Minecraft " + capitalizeCamelCaseName(name);
-		}
-
-		Objects.requireNonNull(environment, "No environment set for run config");
-
-		String runDir = settings.getRunDir();
-
-		if (runDir == null) {
-			runDir = "run";
-		}
-
-		RunConfig runConfig = new RunConfig();
-		runConfig.configName = configName;
-		populate(project, extension, runConfig, environment);
-		runConfig.ideaModuleName = getIdeaModuleName(project, sourceSet);
-		runConfig.runDirIdeaUrl = "file://$PROJECT_DIR$/" + runDir;
-		runConfig.runDir = runDir;
-		runConfig.sourceSet = sourceSet;
-
-		// Custom parameters
-		for (String progArg : settings.getProgramArgs()) {
-			runConfig.programArgs += " " + progArg;
-		}
-
-		for (String vmArg : settings.getVmArgs()) {
-			runConfig.vmArgs += " " + vmArg;
-		}
-
-		runConfig.vmArgs += " -Dfabric.dli.main=" + getMainClass(environment, extension, defaultMain);
-
-		// Remove unnecessary leading/trailing whitespaces we might have generated
-		runConfig.programArgs = runConfig.programArgs.trim();
-		runConfig.vmArgs = runConfig.vmArgs.trim();
-
-		return runConfig;
+	//This can be removed at somepoint, its not ideal but its the best solution I could thing of
+	public static boolean needsUpgrade(File file) throws IOException {
+		String contents = FileUtils.readFileToString(file, StandardCharsets.UTF_8);
+		return !(contents.contains("net.fabricmc.devlaunchinjector.Main"));
 	}
 
 	public String fromDummy(String dummy) throws IOException {
@@ -227,9 +181,7 @@ public class RunConfig {
 
 		dummyConfig = dummyConfig.replace("%NAME%", configName);
 		dummyConfig = dummyConfig.replace("%MAIN_CLASS%", mainClass);
-		dummyConfig = dummyConfig.replace("%ECLIPSE_PROJECT%", eclipseProjectName);
-		dummyConfig = dummyConfig.replace("%IDEA_MODULE%", ideaModuleName);
-		dummyConfig = dummyConfig.replace("%RUN_DIRECTORY%", runDir);
+		dummyConfig = dummyConfig.replace("%MODULE%", projectName);
 		dummyConfig = dummyConfig.replace("%PROGRAM_ARGS%", programArgs.replaceAll("\"", "&quot;"));
 		dummyConfig = dummyConfig.replace("%VM_ARGS%", vmArgs.replaceAll("\"", "&quot;"));
 
@@ -244,7 +196,7 @@ public class RunConfig {
 		return "";
 	}
 
-	private static String getMainClass(String side, LoomGradleExtension extension, String defaultMainClass) {
+	private static String getMainClass(String side, LoomGradleExtension extension) {
 		JsonObject installerJson = extension.getInstallerJson();
 
 		if (installerJson != null && installerJson.has("mainClass")) {
@@ -270,22 +222,14 @@ public class RunConfig {
 			return "net.minecraft.launchwrapper.Launch";
 		}
 
-		return defaultMainClass;
+		return "net.fabricmc.loader.launch.knot.Knot" + side.substring(0, 1).toUpperCase(Locale.ROOT) + side.substring(1).toLowerCase(Locale.ROOT);
 	}
 
-	private static String encodeEscaped(String s) {
-		StringBuilder ret = new StringBuilder();
-
-		for (int i = 0; i < s.length(); i++) {
-			char c = s.charAt(i);
-
-			if (c == '@' && i > 0 && s.charAt(i - 1) == '@' || c == ' ') {
-				ret.append(String.format("@@%04x", (int) c));
-			} else {
-				ret.append(c);
-			}
+	private static String quoteIfNeeded(String input) {
+		if (!input.contains(" ")) {
+			return input;
 		}
 
-		return ret.toString();
+		return String.format("\"%s\"", input);
 	}
 }

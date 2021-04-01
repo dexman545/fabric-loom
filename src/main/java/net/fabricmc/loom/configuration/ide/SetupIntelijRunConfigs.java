@@ -22,7 +22,7 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.configuration.ide;
+package net.fabricmc.loom.util;
 
 import java.io.File;
 import java.io.IOException;
@@ -32,14 +32,14 @@ import org.apache.commons.io.FileUtils;
 import org.gradle.api.Project;
 
 import net.fabricmc.loom.LoomGradleExtension;
-import net.fabricmc.loom.configuration.providers.minecraft.MinecraftNativesProvider;
-import net.fabricmc.loom.configuration.providers.minecraft.assets.MinecraftAssetsProvider;
+import net.fabricmc.loom.providers.MinecraftAssetsProvider;
+import net.fabricmc.loom.providers.MinecraftNativesProvider;
 
 public class SetupIntelijRunConfigs {
 	public static void setup(Project project) {
 		LoomGradleExtension extension = project.getExtensions().getByType(LoomGradleExtension.class);
 
-		File projectDir = project.getRootProject().file(".idea");
+		File projectDir = project.file(".idea");
 
 		if (!projectDir.exists()) {
 			return;
@@ -50,43 +50,41 @@ public class SetupIntelijRunConfigs {
 		} catch (IOException e) {
 			throw new RuntimeException("Failed to generate run configs", e);
 		}
+
+		File runDir = new File(project.getRootDir(), extension.runDir);
+
+		if (!runDir.exists()) {
+			runDir.mkdirs();
+		}
 	}
 
 	private static void generate(Project project) throws IOException {
-		Project rootProject = project.getRootProject();
 		LoomGradleExtension extension = project.getExtensions().getByType(LoomGradleExtension.class);
 
 		if (extension.ideSync()) {
 			//Ensures the assets are downloaded when idea is syncing a project
 			MinecraftAssetsProvider.provide(extension.getMinecraftProvider(), project);
-			MinecraftNativesProvider.provide(project);
+			MinecraftNativesProvider.provide(extension.getMinecraftProvider(), project);
 		}
 
-		String projectPath = project == rootProject ? "" : project.getPath().replace(':', '_');
-
-		File projectDir = rootProject.file(".idea");
+		File projectDir = project.file(".idea");
 		File runConfigsDir = new File(projectDir, "runConfigurations");
+		File clientRunConfigs = new File(runConfigsDir, "Minecraft_Client.xml");
+		File serverRunConfigs = new File(runConfigsDir, "Minecraft_Server.xml");
 
 		if (!runConfigsDir.exists()) {
 			runConfigsDir.mkdirs();
 		}
 
-		for (RunConfigSettings settings : extension.getRunConfigs()) {
-			if (!settings.isIdeConfigGenerated()) {
-				continue;
-			}
+		String clientRunConfig = RunConfig.clientRunConfig(project).fromDummy("idea_run_config_template.xml");
+		String serverRunConfig = RunConfig.serverRunConfig(project).fromDummy("idea_run_config_template.xml");
 
-			RunConfig config = RunConfig.runConfig(project, settings);
-			String name = config.configName.replaceAll("[^a-zA-Z0-9$_]", "_");
+		if (!clientRunConfigs.exists() || RunConfig.needsUpgrade(clientRunConfigs)) {
+			FileUtils.writeStringToFile(clientRunConfigs, clientRunConfig, StandardCharsets.UTF_8);
+		}
 
-			File runConfigs = new File(runConfigsDir, name + projectPath + ".xml");
-			String runConfigXml = config.fromDummy("idea_run_config_template.xml");
-
-			if (!runConfigs.exists()) {
-				FileUtils.writeStringToFile(runConfigs, runConfigXml, StandardCharsets.UTF_8);
-			}
-
-			settings.makeRunDir();
+		if (!serverRunConfigs.exists() || RunConfig.needsUpgrade(serverRunConfigs)) {
+			FileUtils.writeStringToFile(serverRunConfigs, serverRunConfig, StandardCharsets.UTF_8);
 		}
 	}
 }

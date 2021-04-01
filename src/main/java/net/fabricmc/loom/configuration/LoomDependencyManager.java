@@ -22,7 +22,7 @@
  * SOFTWARE.
  */
 
-package net.fabricmc.loom.configuration;
+package net.fabricmc.loom.util;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -33,18 +33,12 @@ import java.util.Map;
 import com.google.gson.JsonObject;
 import org.gradle.api.Project;
 import org.gradle.api.artifacts.Configuration;
-import org.gradle.api.artifacts.Dependency;
-import org.gradle.api.artifacts.DependencySet;
 import org.gradle.api.artifacts.ExternalModuleDependency;
 import org.gradle.api.artifacts.repositories.MavenArtifactRepository;
 
 import net.fabricmc.loom.LoomGradleExtension;
-import net.fabricmc.loom.build.ModCompileRemapper;
-import net.fabricmc.loom.configuration.DependencyProvider.DependencyInfo;
-import net.fabricmc.loom.configuration.mods.ModProcessor;
-import net.fabricmc.loom.configuration.providers.mappings.MappingsProvider;
-import net.fabricmc.loom.util.Constants;
-import net.fabricmc.loom.util.SourceRemapper;
+import net.fabricmc.loom.providers.MappingsProvider;
+import net.fabricmc.loom.util.DependencyProvider.DependencyInfo;
 
 public class LoomDependencyManager {
 	private static class ProviderList {
@@ -56,9 +50,9 @@ public class LoomDependencyManager {
 		}
 	}
 
-	private final List<DependencyProvider> dependencyProviderList = new ArrayList<>();
+	private List<DependencyProvider> dependencyProviderList = new ArrayList<>();
 
-	public <T extends DependencyProvider> T addProvider(T provider) {
+	public void addProvider(DependencyProvider provider) {
 		if (dependencyProviderList.contains(provider)) {
 			throw new RuntimeException("Provider is already registered");
 		}
@@ -69,7 +63,6 @@ public class LoomDependencyManager {
 
 		provider.register(this);
 		dependencyProviderList.add(provider);
-		return provider;
 	}
 
 	public <T> T getProvider(Class<T> clazz) {
@@ -87,7 +80,7 @@ public class LoomDependencyManager {
 
 		MappingsProvider mappingsProvider = null;
 
-		project.getLogger().info(":setting up loom dependencies");
+		project.getLogger().lifecycle(":setting up loom dependencies");
 		LoomGradleExtension extension = project.getExtensions().getByType(LoomGradleExtension.class);
 		Map<String, ProviderList> providerListMap = new HashMap<>();
 		List<ProviderList> targetProviders = new ArrayList<>();
@@ -110,39 +103,31 @@ public class LoomDependencyManager {
 
 		for (ProviderList list : targetProviders) {
 			Configuration configuration = project.getConfigurations().getByName(list.key);
-			DependencySet dependencies = configuration.getDependencies();
-
-			if (dependencies.isEmpty()) {
-				throw new IllegalArgumentException(String.format("No '%s' dependency was specified!", list.key));
-			}
-
-			if (dependencies.size() > 1) {
-				throw new IllegalArgumentException(String.format("Only one '%s' dependency should be specified, but %d were!",
-												list.key,
-												dependencies.size())
-				);
-			}
-
-			for (Dependency dependency : dependencies) {
+			configuration.getDependencies().forEach(dependency -> {
 				for (DependencyProvider provider : list.providers) {
 					DependencyProvider.DependencyInfo info = DependencyInfo.create(project, dependency, configuration);
 
 					try {
-						provider.provide(info, afterTasks::add);
+						provider.provide(info, project, extension, afterTasks::add);
 					} catch (Exception e) {
-						throw new RuntimeException("Failed to provide " + dependency.getGroup() + ":" + dependency.getName() + ":" + dependency.getVersion() + " : " + e.toString(), e);
+						throw new RuntimeException("Failed to provide " + dependency.getGroup() + ":" + dependency.getName() + ":" + dependency.getVersion() + " : " + e.getMessage(), e);
 					}
 				}
-			}
+			});
 		}
 
-		SourceRemapper sourceRemapper = new SourceRemapper(project, true);
-		String mappingsKey = mappingsProvider.getMappingsKey();
+		{
+			String mappingsKey = mappingsProvider.mappingsName + "." + mappingsProvider.minecraftVersion.replace(' ', '_').replace('.', '_').replace('-', '_') + "." + mappingsProvider.mappingsVersion;
+
+			for (RemappedConfigurationEntry entry : Constants.MOD_COMPILE_ENTRIES) {
+				ModCompileRemapper.remapDependencies(project, mappingsKey, extension, project.getConfigurations().getByName(entry.getSourceConfiguration()), project.getConfigurations().getByName(entry.getRemappedConfiguration()), project.getConfigurations().getByName(entry.getTargetConfiguration(project.getConfigurations())), afterTasks::add);
+			}
+		}
 
 		if (extension.getInstallerJson() == null) {
 			//If we've not found the installer JSON we've probably skipped remapping Fabric loader, let's go looking
 			project.getLogger().info("Searching through modCompileClasspath for installer JSON");
-			final Configuration configuration = project.getConfigurations().getByName(Constants.Configurations.MOD_COMPILE_CLASSPATH);
+			final Configuration configuration = project.getConfigurations().getByName(Constants.MOD_COMPILE_CLASSPATH);
 
 			for (File input : configuration.resolve()) {
 				JsonObject jsonObject = ModProcessor.readInstallerJson(input, project);
@@ -155,18 +140,15 @@ public class LoomDependencyManager {
 
 					project.getLogger().info("Found installer JSON in " + input);
 					extension.setInstallerJson(jsonObject);
-					handleInstallerJson(extension.getInstallerJson(), project);
 				}
 			}
 		}
 
-		if (extension.getInstallerJson() == null) {
+		if (extension.getInstallerJson() != null) {
+			handleInstallerJson(extension.getInstallerJson(), project);
+		} else {
 			project.getLogger().warn("fabric-installer.json not found in classpath!");
 		}
-
-		ModCompileRemapper.remapDependencies(project, mappingsKey, extension, sourceRemapper);
-
-		sourceRemapper.remapAll();
 
 		for (Runnable runnable : afterTasks) {
 			runnable.run();
@@ -177,7 +159,7 @@ public class LoomDependencyManager {
 		LoomGradleExtension extension = project.getExtensions().getByType(LoomGradleExtension.class);
 
 		JsonObject libraries = jsonObject.get("libraries").getAsJsonObject();
-		Configuration loaderDepsConfig = project.getConfigurations().getByName(Constants.Configurations.LOADER_DEPENDENCIES);
+		Configuration mcDepsConfig = project.getConfigurations().getByName(Constants.MINECRAFT_DEPENDENCIES);
 		Configuration apDepsConfig = project.getConfigurations().getByName("annotationProcessor");
 
 		libraries.get("common").getAsJsonArray().forEach(jsonElement -> {
@@ -185,7 +167,7 @@ public class LoomDependencyManager {
 
 			ExternalModuleDependency modDep = (ExternalModuleDependency) project.getDependencies().create(name);
 			modDep.setTransitive(false);
-			loaderDepsConfig.getDependencies().add(modDep);
+			mcDepsConfig.getDependencies().add(modDep);
 
 			if (!extension.ideSync()) {
 				apDepsConfig.getDependencies().add(modDep);
